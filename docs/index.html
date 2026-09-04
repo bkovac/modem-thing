@@ -333,10 +333,12 @@ are as follows:</p>
 and it’s active high default.</p>
 <p>For probably the first time in my life I didn’t have any issues
 compiling the kernel module and running it. The mystery kernel I was
-running was a <code>6.12.1-msm8916</code> one with modules enabled.
-Therefore I just downloaded <code>msm8916-mainline</code>, checked it to
-the correct branch and hoped that there weren’t any (or significant)
-changes. And there werent, it just worked.</p>
+running was a <code>6.12.1-msm8916</code> one with modules enabled. It
+had a <code>.config</code> file present which I took.</p>
+<p>Next I downloaded the mainline linux <code>6.12.1</code> kernel and
+hoped that there weren’t any (or significant) changes. This ended up
+being enough, and after a few small patches to the driver the thing just
+worked.</p>
 <p>Below is what the device tree ended up looking like. Notice that the
 CS logic being handled by the display driver.</p>
 <pre><code>spi@78b9000 {

@@ -1,0 +1,233 @@
+From 5825c7f787dcee2ceb4e4c55293880318f10d6b2 Mon Sep 17 00:00:00 2001
+From: BB <veggie_privacy_8y@icloud.com>
+Date: Sun, 28 Jun 2026 18:06:26 +0200
+Subject: [PATCH 2/2] Added dithering.
+
+---
+ README.md          |   3 +-
+ src/drm_iface.c    | 114 +++++++++++++++++++++++++++++++++++++++++++++
+ src/params_iface.c |   7 +++
+ src/params_iface.h |   1 +
+ 4 files changed, 124 insertions(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 49ac1e2..94f93b4 100644
+--- a/README.md
++++ b/README.md
+@@ -43,7 +43,8 @@ To make changes persistent:
+ * Edit the file `/etc/modules` and change the line `sharp-drm` to `sharp-drm <param>=<setting>`
+ 
+ * `auto_clear`: `1` to blank the screen when the display driver is unloaded (default enabled). If disabled, screen contents will remain until power is removed.
+-* `mono_cutoff`: Consider all pixels with one of R, G, B below this threshold to be black, otherwise white (default `32`)
++* `mono_cutoff`: Consider all pixels with one of R, G, B below this threshold to be black, otherwise white (default `32`). Only used when `dither` is `0`.
++* `dither`: Grayscale-to-mono dithering mode (default `0`). `0` disables dithering and uses a plain threshold at `mono_cutoff` (original behavior). `1` enables ordered dithering with an 8x8 Bayer matrix. `2` enables Floyd-Steinberg error-diffusion dithering (best quality for photos/gradients, slightly more CPU). The dithering modes ignore `mono_cutoff` and sweep the full tonal range so brightness is preserved, letting the 1-bit panel approximate grayscale shading. Example: `echo 2 | sudo tee /sys/module/sharp_drm/parameters/dither`
+ * `mono_invert`: `0` for white-on-black, `1` for black-on-white. Can be toggled on-device by pressing Berry, then Zero (Meta mode + 0). For more information on Meta mode keymappings, see [https://github.com/ardangelo/beepberry-keyboard-driver/README.md]
+ * `overlays`: 0 to disable overlays (default enabled). Not recommended to disable, overlays are used to display modifier key state and [key reference overlays](https://github.com/ardangelo/beepy-symbol-overlay/README.md)
+ 
+diff --git a/src/drm_iface.c b/src/drm_iface.c
+index e6a9fda..888c0a8 100644
+--- a/src/drm_iface.c
++++ b/src/drm_iface.c
+@@ -15,6 +15,7 @@
+ #include <linux/spi/spi.h>
+ #include <linux/mutex.h>
+ #include <linux/list.h>
++#include <linux/string.h>
+ #include <linux/workqueue.h>
+ 
+ #include <linux/io.h>
+@@ -58,6 +59,16 @@
+ #define CMD_CLEAR_SCREEN 0b00100000
+ #define CMD_TOGGLE_VCOM 0b01000000
+ 
++// Dithering modes for g_param_dither
++#define DITHER_NONE 0
++#define DITHER_BAYER 1
++#define DITHER_FLOYD_STEINBERG 2
++
++// Fixed comparison midpoint for dithering. Unlike threshold mode, dithering
++// sweeps the full tonal range, so it is always centered at 128 to preserve
++// brightness rather than reusing the text-tuned mono_cutoff.
++#define DITHER_MIDPOINT 128
++
+ #define GPIO_BASE_ADDR 0x91105000
+ #define GPIO_CS_PIN 14
+ #define SPI_CS_ADDR1 0x9140b004
+@@ -103,6 +114,11 @@ struct sharp_memory_panel
+ 	unsigned char *cmd_buf;
+ 	unsigned char *trailer_buf;
+ 
++	// Per-row error accumulators for Floyd-Steinberg dithering,
++	// each `width` ints wide
++	int *fs_err_curr;
++	int *fs_err_next;
++
+ 	struct gpio_desc *gpio_disp;
+ 	struct gpio_desc *gpio_vcom;
+ 	struct gpio_desc *gpio_cs;
+@@ -353,6 +369,90 @@ static void draw_overlays(struct sharp_memory_panel *panel, u8* buf, int width,
+ 	}
+ }
+ 
++// Ordered-dithering threshold matrix (Bayer 8x8), entries 0..63
++static const u8 sharp_memory_bayer8[8][8] = {
++	{  0, 32,  8, 40,  2, 34, 10, 42 },
++	{ 48, 16, 56, 24, 50, 18, 58, 26 },
++	{ 12, 44,  4, 36, 14, 46,  6, 38 },
++	{ 60, 28, 52, 20, 62, 30, 54, 22 },
++	{  3, 35, 11, 43,  1, 33,  9, 41 },
++	{ 51, 19, 59, 27, 49, 17, 57, 25 },
++	{ 15, 47,  7, 39, 13, 45,  5, 37 },
++	{ 63, 31, 55, 23, 61, 29, 53, 21 },
++};
++
++// Convert an 8-bit grayscale region to a pure black/white (0 or 255) image
++// in place, using the dithering mode selected by g_param_dither. The result
++// is still 8-bit so the existing mono packing step can consume it unchanged.
++//
++// `y0` is the absolute framebuffer row of the first line, so the ordered
++// dither pattern stays aligned across partial-region updates. The comparison
++// is centered on DITHER_MIDPOINT so brightness is preserved.
++static void sharp_memory_dither_gray8(struct sharp_memory_panel *panel,
++	u8 *buf, int width, int height, int y0)
++{
++	int line, x;
++
++	if (g_param_dither == DITHER_BAYER) {
++
++		for (line = 0; line < height; line++) {
++			int my = (y0 + line) & 7;
++
++			for (x = 0; x < width; x++) {
++				int g = buf[(line * width) + x];
++
++				// Map matrix entry 0..63 to a full 0..255 threshold
++				// sweep so the average brightness is preserved
++				int b = sharp_memory_bayer8[my][x & 7];
++				int thr = (b * 255 + 32) / 63;
++
++				buf[(line * width) + x] = (g >= thr) ? 255 : 0;
++			}
++		}
++
++	} else if (g_param_dither == DITHER_FLOYD_STEINBERG) {
++		int *cur = panel->fs_err_curr;
++		int *nxt = panel->fs_err_next;
++
++		if (!cur || !nxt) {
++			return;
++		}
++
++		memset(cur, 0, width * sizeof(int));
++
++		for (line = 0; line < height; line++) {
++			int *tmp;
++
++			memset(nxt, 0, width * sizeof(int));
++
++			for (x = 0; x < width; x++) {
++				int g = buf[(line * width) + x] + cur[x];
++				int q = (g >= DITHER_MIDPOINT) ? 255 : 0;
++				int e = g - q;
++
++				buf[(line * width) + x] = (u8)q;
++
++				// Distribute quantization error to neighbors
++				if (x + 1 < width) {
++					cur[x + 1] += (e * 7) / 16;
++				}
++				if (x - 1 >= 0) {
++					nxt[x - 1] += (e * 3) / 16;
++				}
++				nxt[x] += (e * 5) / 16;
++				if (x + 1 < width) {
++					nxt[x + 1] += (e * 1) / 16;
++				}
++			}
++
++			// Next line's incoming error becomes the current row
++			tmp = cur;
++			cur = nxt;
++			nxt = tmp;
++		}
++	}
++}
++
+ static size_t sharp_memory_gray8_to_mono_tagged(u8 *buf, int width, int height, int y0)
+ {
+ 	int line, b8, b1;
+@@ -445,6 +545,12 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
+ 		draw_overlays(panel, buf, fb->width, clip);
+ 	}
+ 
++	// Optionally dither the grayscale region to black/white in place
++	if (g_param_dither != DITHER_NONE) {
++		sharp_memory_dither_gray8(panel, buf,
++			(clip->x2 - clip->x1), (clip->y2 - clip->y1), clip->y1);
++	}
++
+ 	// Convert in-place from 8-bit grayscale to mono
+ 	*result_len = sharp_memory_gray8_to_mono_tagged(buf,
+ 		(clip->x2 - clip->x1), (clip->y2 - clip->y1), clip->y1);
+@@ -756,6 +862,10 @@ int drm_probe(struct spi_device *spi)
+ 	panel->cmd_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+ 	panel->trailer_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+ 
++	// Floyd-Steinberg error rows
++	panel->fs_err_curr = devm_kzalloc(dev, panel->width * sizeof(int), GFP_KERNEL);
++	panel->fs_err_next = devm_kzalloc(dev, panel->width * sizeof(int), GFP_KERNEL);
++
+ 	// DRM mode settings
+ 	drm->mode_config.min_width = mode->hdisplay;
+ 	drm->mode_config.max_width = mode->hdisplay;
+@@ -923,6 +1033,10 @@ int drm_probe_qemu(struct device *dev, const char *serial_dev)
+ 	panel->cmd_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+ 	panel->trailer_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+ 
++	// Floyd-Steinberg error rows
++	panel->fs_err_curr = devm_kzalloc(dev, panel->width * sizeof(int), GFP_KERNEL);
++	panel->fs_err_next = devm_kzalloc(dev, panel->width * sizeof(int), GFP_KERNEL);
++
+ 	drm->mode_config.min_width = mode->hdisplay;
+ 	drm->mode_config.max_width = mode->hdisplay;
+ 	drm->mode_config.min_height = mode->vdisplay;
+diff --git a/src/params_iface.c b/src/params_iface.c
+index 2906474..3f32def 100644
+--- a/src/params_iface.c
++++ b/src/params_iface.c
+@@ -7,6 +7,7 @@
+ 
+ int g_param_mono_cutoff = 32;
+ int g_param_mono_invert = 0;
++int g_param_dither = 0;
+ int g_param_overlays = 1;
+ int g_param_auto_clear = 1;
+ 
+@@ -36,6 +37,12 @@ MODULE_PARM_DESC(mono_cutoff,
+ module_param_cb(mono_invert, &u8_param_ops, &g_param_mono_invert, 0660);
+ MODULE_PARM_DESC(mono_invert, "0 for no inversion, 1 for inversion");
+ 
++module_param_cb(dither, &u8_param_ops, &g_param_dither, 0660);
++MODULE_PARM_DESC(dither,
++	"Grayscale-to-mono dithering: 0 off (threshold at mono_cutoff), "
++	"1 ordered (Bayer 8x8), 2 Floyd-Steinberg. "
++	"Dithering modes ignore mono_cutoff and preserve brightness");
++
+ module_param_cb(overlays, &u8_param_ops, &g_param_overlays, 0660);
+ MODULE_PARM_DESC(overlays, "0 for no overlays, 1 for overlays");
+ 
+diff --git a/src/params_iface.h b/src/params_iface.h
+index 2621fd9..057e431 100644
+--- a/src/params_iface.h
++++ b/src/params_iface.h
+@@ -3,6 +3,7 @@
+ 
+ extern int g_param_mono_cutoff;
+ extern int g_param_mono_invert;
++extern int g_param_dither;
+ extern int g_param_overlays;
+ extern int g_param_auto_clear;
+ 
+-- 
+2.54.0
+
