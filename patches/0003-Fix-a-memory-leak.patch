@@ -1,0 +1,24 @@
+From c56c4f9d7d1e8ec90f3b95a1a4951176dffa117b Mon Sep 17 00:00:00 2001
+From: BB <veggie_privacy_8y@icloud.com>
+Date: Sat, 12 Sep 2026 18:16:13 +0200
+Subject: [PATCH] Fix a memory leak.
+
+---
+ src/drm_iface.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/drm_iface.c b/src/drm_iface.c
+index 888c0a8..1943c6e 100644
+--- a/src/drm_iface.c
++++ b/src/drm_iface.c
+@@ -531,6 +531,7 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
+ 	// DMA `clip` into `buf` and convert to 8-bit grayscale
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+ 	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip, &fmtcnv_state);
++	drm_format_conv_state_release(&fmtcnv_state);
+ #else
+ 	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip);
+ #endif
+-- 
+2.54.0
+
